@@ -6,6 +6,7 @@ from utils import train_model
 
 # ------- Outer SDE model class containing training, plotting, prediction attributes --------
 
+
 class GPSDE(object):
     def __init__(self, model, inference):
         super(GPSDE, self).__init__()
@@ -177,3 +178,115 @@ class GPSDEmodel(nn.Module):
             ell[idx, :] = self.like(mu_sp[idx], cov_sp[idx], idx)
 
         return ell.sum(), kld, prior_trans, prior_map
+
+
+class DenseGPSDEmodel(nn.Module):
+    """
+    This version assumes that observations are sampled densely on the same grid used for inference.
+    This will be true e.g. in the Poisson likelihood where observations are binned counts on a chosen grid.
+    """
+
+    def __init__(self, nLatent, transfunc, outputMapping, like, nLeg=50):
+        super(DenseGPSDEmodel, self).__init__()
+
+        self.outputMapping = outputMapping
+        self.transfunc = transfunc
+        self.like = like
+        self.nLatent = nLatent
+        self.KLdiv = KullbackLeibler(self.like.trLen, nLeg=None, dt=self.like.dtstep)
+        self.initialiseInitialState()
+        torch.set_default_dtype(float_type)
+
+    def initialiseInitialState(self):
+        self.initialMean = [torch.zeros(1, self.nLatent).type(float_type) for _ in range(self.like.nTrials)]  # 1 x K
+        self.initialCov = [var_init * torch.eye(self.nLatent).type(float_type) for _ in range(self.like.nTrials)]  # K x K
+
+    def collectInferenceResults(self, inference):
+
+        # get time points where we want to evaluate marginals
+        m = [[] for _ in range(inference.nTrials)]
+        S = [[] for _ in range(inference.nTrials)]
+        A = [[] for _ in range(inference.nTrials)]
+        b = [[] for _ in range(inference.nTrials)]
+
+        for idx in range(inference.nTrials):
+            grid_times = inference.t_grid[idx]
+            # get marginals
+            m[idx], S[idx] = inference.predict_marginals(idx, grid_times)
+            A[idx], b[idx] = inference.predict_conditionalParams(idx, grid_times)
+
+        return (m, S, A, b)  # output tuple
+
+    def closedFormUpdates(self, m, S, A, b):
+        self.transfunc.closedFormUpdates(m, S, A, b, self.like.trLen, self.KLdiv.wwLeg)
+
+    def forward(self, m, S, A, b):
+
+        kld = torch.zeros(self.like.nTrials, 1)
+        ell = torch.zeros(self.like.nTrials, 1)
+
+        for idx in range(self.like.nTrials):
+            mu, cov, _ = self.outputMapping(m[idx], S[idx])
+            fx, ffx, dfdx, _ = self.transfunc(m[idx], S[idx])
+            kld[idx, :] = self.KLdiv(fx, ffx, dfdx, m[idx], S[idx], A[idx], b[idx])
+            ell[idx, :] = self.like(mu, cov, idx)
+
+        prior_trans = self.transfunc.log_prior_distribution()
+        prior_map = self.outputMapping.log_prior_distribution()
+
+        return ell.sum(), kld.sum(), prior_trans, prior_map
+
+
+class PointProcessGPSDEmodel(DenseGPSDEmodel):
+    def __init__(self, nLatent, transfunc, outputMapping, like, nLeg=50):
+        super(PointProcessGPSDEmodel, self).__init__(nLatent, transfunc, outputMapping, like, nLeg)
+
+        # override other stuff to use quadrature
+        self.KLdiv = KullbackLeibler(self.like.trLen, nLeg=nLeg)
+
+    def collectInferenceResults(self, inference):
+        # get time points where we want to evaluate marginals
+        m_sp = [[] for _ in range(inference.nTrials)]
+        S_sp = [[] for _ in range(inference.nTrials)]
+
+        nquad = self.like.xxLeg.size()[1]  # number of quadrature nodes
+
+        # create empty tensors to store predicted means and variances across all trials
+        m_qu = torch.zeros(inference.nTrials, nquad, 1, inference.nLatent).type(float_type)
+        S_qu = torch.zeros(inference.nTrials, nquad, inference.nLatent, inference.nLatent).type(float_type)
+        A_qu = torch.zeros(inference.nTrials, nquad, inference.nLatent, inference.nLatent).type(float_type)
+        b_qu = torch.zeros(inference.nTrials, nquad, 1, inference.nLatent).type(float_type)
+
+        for idx in range(inference.nTrials):
+            spike_times = self.like.Y[idx]
+            quad_times = self.like.xxLeg[idx]
+            # get marginals
+            m_sp[idx], S_sp[idx] = inference.predict_marginals(idx, spike_times)
+            m_qu[idx, :, :, :], S_qu[idx, :, :, :] = inference.predict_marginals(idx, quad_times)
+            A_qu[idx, :, :, :], b_qu[idx, :, :, :] = inference.predict_conditionalParams(idx, quad_times)
+
+        return (m_sp, S_sp, m_qu, S_qu, A_qu, b_qu)  # output tuple
+
+    def closedFormUpdates(self, m_sp, S_sp, m_qu, S_qu, A_qu, b_qu):
+        self.transfunc.closedFormUpdates(m_qu, S_qu, A_qu, b_qu, self.like.trLen, self.KLdiv.wwLeg)
+
+    def forward(self, m_sp, S_sp, m_qu, S_qu, A_qu, b_qu):
+        # make empty lists for storing values
+        mu_sp = [[] for _ in range(len(m_sp))]
+        cov_sp = [[] for _ in range(len(m_sp))]
+
+        # get predicted means at spike times
+        for idx in range(len(m_sp)):
+            mu_sp[idx], cov_sp[idx], _ = self.outputMapping(m_sp[idx], S_sp[idx], self.like.spikeID[idx])
+
+        # get tensors of predicted means and variances at quadrature nodes
+        mu_qu, cov_qu, prior_map = self.outputMapping(m_qu, S_qu)  # R x T x 1 x K and R x T x K x K
+
+        # compute KL divergence between approx post and prior SDE
+        fx, ffx, dfdx, prior_trans = self.transfunc(m_qu, S_qu)
+        kld = self.KLdiv(fx, ffx, dfdx, m_qu, S_qu, A_qu, b_qu)
+
+        # compute expected log likelihood
+        ell = self.like(mu_sp, cov_sp, mu_qu, cov_qu)
+
+        return ell, kld, prior_trans, prior_map
